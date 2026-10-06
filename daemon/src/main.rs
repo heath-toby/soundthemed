@@ -11,12 +11,19 @@
 //!   soundthemed create-theme ... # create theme from folder
 
 mod battery;
+mod camera;
 mod dbus_service;
+mod launches;
+mod lid;
+mod mounts;
 mod network;
 mod niri;
 mod notifications;
+mod pipewire;
 mod player;
+mod power_profile;
 mod session;
+mod thermal;
 mod udev_monitor;
 mod volume;
 
@@ -130,8 +137,9 @@ async fn run_daemon() {
             let battery_tx = tx.clone();
             let low = cfg.read().unwrap().battery_low_percent;
             let crit = cfg.read().unwrap().battery_critical_percent;
+            let charged = cfg.read().unwrap().battery_charged_percent;
             tokio::spawn(async move {
-                battery::watch(battery_tx, low, crit).await;
+                battery::watch(battery_tx, low, crit, charged).await;
             });
         }
 
@@ -149,12 +157,6 @@ async fn run_daemon() {
             });
         }
 
-        if sources.volume {
-            let vol_tx = tx.clone();
-            tokio::spawn(async move {
-                volume::watch(vol_tx).await;
-            });
-        }
 
         if sources.notifications {
             let notif_tx = tx.clone();
@@ -163,11 +165,57 @@ async fn run_daemon() {
             });
         }
 
-        // Niri compositor bell detection (auto-detects, no config needed)
+        if sources.camera {
+            camera::spawn(tx.clone());
+        }
+
+        if sources.microphone || sources.audio_output || sources.volume {
+            let volume = sources.volume.then(|| volume::spawn(tx.clone()));
+            pipewire::spawn(tx.clone(), sources.microphone, sources.audio_output, volume);
+        }
+
+        if sources.lid {
+            let lid_tx = tx.clone();
+            tokio::spawn(async move {
+                lid::watch(lid_tx).await;
+            });
+        }
+
+        if sources.thermal {
+            let thermal_tx = tx.clone();
+            let power_limits = cfg.read().unwrap().throttle_power_limits;
+            let hot = cfg.read().unwrap().thermal_hot_celsius;
+            let cool = cfg.read().unwrap().thermal_cool_celsius;
+            tokio::spawn(async move {
+                thermal::watch(thermal_tx, power_limits, hot, cool).await;
+            });
+        }
+
+        if sources.power_profile {
+            let profile_tx = tx.clone();
+            tokio::spawn(async move {
+                power_profile::watch(profile_tx).await;
+            });
+        }
+
+        if sources.mounts {
+            mounts::spawn(tx.clone());
+        }
+
+        if sources.launches {
+            let launch_tx = tx.clone();
+            tokio::spawn(async move {
+                launches::watch(launch_tx).await;
+            });
+        }
+
+        // Niri compositor events (auto-detects); the bell is always on,
+        // window and screenshot sounds follow the "windows" source.
         {
             let niri_tx = tx.clone();
+            let windows = sources.windows;
             tokio::spawn(async move {
-                niri::watch(niri_tx).await;
+                niri::watch(niri_tx, windows).await;
             });
         }
 
