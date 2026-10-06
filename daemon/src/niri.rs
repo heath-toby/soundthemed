@@ -8,8 +8,13 @@
 //!     If it exits, that's "app-closed"; if it keeps running (e.g. in
 //!     the system tray), that's "app-hidden", with "app-closed" once
 //!     it really exits and "app-unhidden" if a window comes back
+//!   - Programs that start without a window: a freshly started
+//!     process registering a system tray icon (StatusNotifierItem)
+//!     with no window to show is "app-launched", and from then on
+//!     counts as running in the background
 //!   - Screenshots taken with niri's built-in screenshot action
 
+use futures_util::StreamExt;
 use serde_json::Value;
 use soundthemed_shared::sound_ids::SoundEvent;
 use std::collections::{HashMap, HashSet};
@@ -31,6 +36,24 @@ const SWITCH_HOLD: Duration = Duration::from_millis(150);
 /// After a program's last window closes, how long its process gets to
 /// exit before it counts as still running in the background.
 const QUIT_GRACE: Duration = Duration::from_secs(2);
+
+/// A tray icon counts as a launch only for a process this young, so
+/// icons re-registering (e.g. when the tray restarts) stay quiet.
+const TRAY_LAUNCH_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// How long a program with a new tray icon gets to open a window
+/// (which then announces the launch itself) before the icon does.
+const TRAY_WINDOW_GRACE: Duration = Duration::from_secs(3);
+
+#[zbus::proxy(
+    interface = "org.kde.StatusNotifierWatcher",
+    default_service = "org.kde.StatusNotifierWatcher",
+    default_path = "/StatusNotifierWatcher"
+)]
+trait StatusNotifierWatcher {
+    #[zbus(signal)]
+    fn status_notifier_item_registered(&self, service: String) -> zbus::Result<()>;
+}
 
 /// Start watching Niri compositor events. `windows` enables the
 /// window, program and screenshot sounds; the bell is always on.
@@ -122,12 +145,14 @@ fn open_pidfd(pid: i32) -> Option<AsyncFd<OwnedFd>> {
     AsyncFd::with_interest(fd, Interest::READABLE).ok()
 }
 
-/// Watch a process whose last window just closed. A pidfd becomes
-/// readable when the process exits.
+/// Watch a program's process with no windows. A pidfd becomes readable
+/// when the process exits. `just_closed`: its last window just closed,
+/// so give it QUIT_GRACE to exit before reporting it still running.
 fn watch_process(
     pid: i32,
     program: String,
     generation: u64,
+    just_closed: bool,
     updates: mpsc::UnboundedSender<ProcessUpdate>,
 ) {
     tokio::spawn(async move {
@@ -145,15 +170,75 @@ fn watch_process(
             return;
         };
 
-        if time::timeout(QUIT_GRACE, pidfd.readable()).await.is_ok() {
-            send(ProcessNews::Exited);
-            return;
+        if just_closed {
+            if time::timeout(QUIT_GRACE, pidfd.readable()).await.is_ok() {
+                send(ProcessNews::Exited);
+                return;
+            }
+            send(ProcessNews::StillRunning);
         }
-        send(ProcessNews::StillRunning);
 
         let _ = pidfd.readable().await;
         send(ProcessNews::Exited);
     });
+}
+
+/// How long ago a process started.
+fn process_age(pid: u32) -> Option<Duration> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields after the parenthesised command name; starttime is field 22
+    let after_comm = &stat[stat.rfind(')')? + 2..];
+    let start_ticks: f64 = after_comm.split(' ').nth(19)?.parse().ok()?;
+    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+    let uptime: f64 = std::fs::read_to_string("/proc/uptime")
+        .ok()?
+        .split(' ')
+        .next()?
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs_f64((uptime - start_ticks / ticks_per_sec).max(0.0)))
+}
+
+/// The D-Bus name in a StatusNotifierItem registration, which may be a
+/// bus name, or a bus name followed by an object path.
+fn tray_item_bus_name(service: &str) -> &str {
+    match service.find('/') {
+        Some(slash) => service[..slash].trim_end_matches(':'),
+        None => service,
+    }
+}
+
+/// Report processes that just started and registered a tray icon,
+/// once they've had TRAY_WINDOW_GRACE to open a window instead.
+async fn watch_tray(launches: mpsc::UnboundedSender<u32>) -> zbus::Result<()> {
+    let connection = zbus::Connection::session().await?;
+    let watcher = StatusNotifierWatcherProxy::builder(&connection)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await?;
+    let dbus = zbus::fdo::DBusProxy::new(&connection).await?;
+    let mut registrations = watcher.receive_status_notifier_item_registered().await?;
+
+    log::info!("niri: watching tray icon registrations");
+
+    while let Some(signal) = registrations.next().await {
+        let Ok(args) = signal.args() else { continue };
+        let Ok(name) = zbus::names::BusName::try_from(tray_item_bus_name(&args.service)) else {
+            continue;
+        };
+        let Ok(pid) = dbus.get_connection_unix_process_id(name).await else { continue };
+        if process_age(pid).is_none_or(|age| age > TRAY_LAUNCH_MAX_AGE) {
+            continue;
+        }
+
+        let launches = launches.clone();
+        tokio::spawn(async move {
+            time::sleep(TRAY_WINDOW_GRACE).await;
+            let _ = launches.send(pid);
+        });
+    }
+
+    Ok(())
 }
 
 async fn watch_inner(
@@ -179,6 +264,12 @@ async fn watch_inner(
     let mut lines = BufReader::new(stdout).lines();
 
     let (process_tx, mut process_rx) = mpsc::unbounded_channel::<ProcessUpdate>();
+    let (tray_tx, mut tray_rx) = mpsc::unbounded_channel::<u32>();
+    tokio::spawn(async move {
+        if let Err(e) = watch_tray(tray_tx).await {
+            log::info!("niri: tray icons not watched ({e})");
+        }
+    });
 
     let mut open_windows = Windows::default();
     let mut urgent_windows: HashSet<u64> = HashSet::new();
@@ -282,7 +373,13 @@ async fn watch_inner(
                                 // Wait to see whether the process exits
                                 generation += 1;
                                 watching.insert(program.to_owned(), generation);
-                                watch_process(pid, program.to_owned(), generation, process_tx.clone());
+                                watch_process(
+                                    pid,
+                                    program.to_owned(),
+                                    generation,
+                                    true,
+                                    process_tx.clone(),
+                                );
                             }
                             Some((_, None)) => sounds.push(SoundEvent::AppClosed),
                             None => {}
@@ -311,6 +408,19 @@ async fn watch_inner(
             _ = time::sleep_until(pending_switch.map_or_else(Instant::now, |(at, _)| at)), if pending_switch.is_some() => {
                 pending_switch = None;
                 sounds.push(SoundEvent::WindowSwitch);
+            }
+            Some(pid) = tray_rx.recv() => {
+                let program = format!("pid:{pid}");
+                let has_window = open_windows.program_window_count(&program) > 0;
+                if !seeded || has_window || watching.contains_key(&program) {
+                    continue;
+                }
+                log::info!("niri: {program} started in the background (tray icon, no window)");
+                generation += 1;
+                watching.insert(program.clone(), generation);
+                hidden.insert(program.clone());
+                watch_process(pid as i32, program, generation, false, process_tx.clone());
+                sounds.push(SoundEvent::AppLaunched);
             }
             Some(update) = process_rx.recv() => {
                 if watching.get(&update.program) != Some(&update.generation) {
